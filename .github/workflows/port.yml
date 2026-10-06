@@ -10,18 +10,18 @@ on:
         description: 'ColorOS 移植包直链'
         required: true
       kernel_source_repo:
-        description: '内核源码仓库地址'
-        required: true
+        description: '内核源码仓库地址（可选：root 关闭时仅用于分析，可留空走 boot.img 提取）'
+        required: false
       kernel_branch:
         description: '内核分支'
         required: false
         default: 'lineage-20'
       defconfig_name:
         description: 'defconfig 名'
-        required: true
+        required: false
       device_tree_repo:
-        description: '设备树仓库地址'
-        required: true
+        description: '设备树仓库地址（port.yml 中不使用，可留空）'
+        required: false
 
 jobs:
   port:
@@ -48,13 +48,45 @@ jobs:
               walk("", cfg)
           PYEOF
 
+      - name: 释放磁盘空间（ROM 镜像需要 40GB+）
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm /opt/az 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          df -h /
+
       - name: 安装依赖
         run: |
           sudo apt update
           sudo apt install -y python3 python3-pip unzip zip aria2 \
-            android-sdk-libsparse-utils erofs-utils simg2img img2simg \
-            brotli lz4 xz-utils u-boot-tools
+            android-sdk-libsparse-utils simg2img img2simg \
+            brotli lz4 xz-utils u-boot-tools \
+            p7zip-full e2fsprogs jq curl \
+            liblz4-dev liblzma-dev zlib1g-dev uuid-dev \
+            autoconf automake libtool pkg-config build-essential
           pip3 install protobuf pyyaml
+
+      - name: 安装 payload-dumper-go
+        run: |
+          URL=$(curl -sL https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
+            | jq -r '.assets[].browser_download_url | select(test("linux_amd64"))' | head -1)
+          curl -sL "$URL" -o /tmp/pdg.tar.gz
+          mkdir -p /tmp/pdg && tar -xzf /tmp/pdg.tar.gz -C /tmp/pdg
+          sudo install /tmp/pdg/payload-dumper-go /usr/local/bin/
+          payload-dumper-go --help 2>&1 | head -1
+
+      - name: 构建最新 erofs-utils（apt 的 1.4 过旧，不支持新 EROFS 特性）
+        run: |
+          git clone --depth 1 --branch v1.9.4 https://github.com/erofs/erofs-utils.git /tmp/erofs-utils
+          cd /tmp/erofs-utils
+          ./autogen.sh
+          ./configure
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          mkfs.erofs -V 2>&1 | head -1
+          fsck.erofs -V 2>&1 | head -1
 
       - name: 下载固件
         run: bash scripts/download.sh "${{ inputs.base_rom_url }}" "${{ inputs.coloros_url }}"
@@ -151,6 +183,7 @@ jobs:
           SUPER_SIZE: ${{ env.CFG_PACK_SUPER_SIZE }}
           DEVICE_MODEL: ${{ env.CFG_DEVICE_MODEL }}
           SYSTEM_NAME: ${{ env.CFG_DEVICE_SYSTEM_NAME }}
+          ANDROID_VER: "16"
         run: bash scripts/pack.sh
 
       - name: 验证镜像
@@ -169,6 +202,7 @@ jobs:
           SUPER_SIZE: ${{ env.CFG_PACK_SUPER_SIZE }}
           DEVICE_MODEL: ${{ env.CFG_DEVICE_MODEL }}
           SYSTEM_NAME: ${{ env.CFG_DEVICE_SYSTEM_NAME }}
+          ANDROID_VER: "16"
         run: bash scripts/pack.sh
 
       - name: 二次验证
@@ -197,6 +231,7 @@ jobs:
           files: |
             work/output/*.zip
             work/output/*.img
+            work/output/flash-fastbootd.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -222,7 +257,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.CFG_DEVICE_MODEL }}-${{ env.CFG_DEVICE_SYSTEM_NAME }}
-          path: |
-            work/output/*.zip
-            work/output/*.img
+          path: work/output/
           retention-days: 7

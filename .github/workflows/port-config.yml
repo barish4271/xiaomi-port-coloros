@@ -4,7 +4,7 @@
 
 device:
   # 机型代号
-  model: "cannon"
+  model: "alioth"
   # 系统名
   system_name: "ColorOS"
   # 挖孔坐标（留空跳过）
@@ -16,19 +16,19 @@ device:
 
 root:
   # 是否集成 KernelSU
-  enable: true
+  enable: false
   # Root 方案：kernelsu-next / kernelsu
   type: "kernelsu-next"
   # KernelSU 版本（留空用最新）
   version: ""
 
 kernel_patch:
-  # MTK BPF 补丁（4.14/4.19 必开）
-  enable_bpf: true
+  # MTK BPF 补丁（4.14/4.19 必开）— только для MediaTek; alioth = SD870, отключено
+  enable_bpf: false
 
 pack:
-  # 打包模式：zip / super / both
-  mode: "both"
+  # 打包模式：zip / super / both — alioth 走 fastbootd 逐分区刷入，用 super
+  mode: "super"
   # super 分区大小（字节）
   super_size: "8589934592"
 
@@ -88,4 +88,4 @@ upload:
   release: true
   r2: false
   alist: false
-  artifact: false
+  artifact: true

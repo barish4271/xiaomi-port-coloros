@@ -2,19 +2,22 @@
 set -e
 cd work
 
-PACK_MODE="${PACK_MODE:-zip}"
+PACK_MODE="${PACK_MODE:-super}"
 SUPER_SIZE="${SUPER_SIZE:-8589934592}"
 OUT=output
 mkdir -p "$OUT"
 KERNEL_HAS_EROFS="${KERNEL_HAS_EROFS:-true}"
 KERNEL_HAS_EROFS_LZ4="${KERNEL_HAS_EROFS_LZ4:-true}"
 
-# 命名参数：优先 CFG_，其次直接变量，最后默认值
-DEVICE="${CFG_DEVICE_MODEL:-${DEVICE_MODEL:-cannon}}"
+# 命名参数
+DEVICE="${CFG_DEVICE_MODEL:-${DEVICE_MODEL:-alioth}}"
 SYSTEM_NAME="${CFG_DEVICE_SYSTEM_NAME:-${SYSTEM_NAME:-ColorOS}}"
-ANDROID_VER="${ANDROID_VER:-15}"
+ANDROID_VER="${ANDROID_VER:-16}"
 ANDROID_TAG="A${ANDROID_VER}"
 DATE_TAG=$(date +%y%m%d)
+
+# 底包的 vbmeta（刷入时配 --disable-verity --disable-verification 使用）
+[ -f base/vbmeta.img ] && cp base/vbmeta.img "$OUT/vbmeta-${DEVICE}.img" || true
 
 pack_partitions() {
   cd coloros
@@ -31,42 +34,19 @@ pack_partitions() {
         continue
       fi
     fi
-    SIZE_MB=$(($(du -sk "$name" | cut -f1) / 1024 + 100))
-    make_ext4fs -s -l "${SIZE_MB}M" -a "/$name" "$name.img" "$name"
+    # ext4 回退：mke2fs（make_ext4fs 在 Ubuntu 上不可用）
+    SIZE_MB=$(($(du -sk "$name" | cut -f1) / 1024 + 128))
+    mke2fs -F -q -t ext4 -b 4096 -d "$name" -E lazy_itable_init=0 "${SIZE_MB}M" "$name.img"
   done
   cd ..
 }
 
-build_zip() {
-  cd "$OUT"
-  mkdir -p META-INF/com/google/android
-  cat > META-INF/com/google/android/updater-script << 'EOFS'
-ui_print("========================================");
-ui_print("ColorOS Port");
-ui_print("========================================");
-package_extract_dir("system", "/system");
-package_extract_dir("vendor", "/vendor");
-package_extract_dir("my_product", "/my_product");
-package_extract_dir("my_stock", "/my_stock");
-ui_print("Done!");
-EOFS
-  cat > META-INF/com/google/android/update-binary << 'EOFB'
-#!/sbin/sh
-OUTFD=$2
-ZIPFILE=$3
-unzip -o "$ZIPFILE" 'META-INF/com/google/android/updater-script' -d /tmp > /dev/null
-. /tmp/META-INF/com/google/android/updater-script
-EOFB
-  chmod +x META-INF/com/google/android/update-binary
-  cp ../coloros/*.img . 2>/dev/null || true
-
-  ZIP_NAME="${DEVICE}-${SYSTEM_NAME}-${ANDROID_TAG}-${DATE_TAG}.zip"
-  zip -r "$ZIP_NAME" META-INF/ *.img 2>/dev/null
-  echo ">>> 卡刷包: $OUT/$ZIP_NAME"
-  cd ..
-}
-
 build_super() {
+  # 需要 lpmake（AOSP partition_tools，apt 里没有）
+  if ! command -v lpmake > /dev/null 2>&1; then
+    echo "!!! lpmake 不可用，跳过 super.img（请用 fastbootd 逐分区刷入 flash-fastbootd.sh）"
+    return 0
+  fi
   PARTITIONS=()
   for img in coloros/*.img; do
     name=$(basename "$img" .img)
@@ -80,25 +60,66 @@ build_super() {
     --group=main:"$SUPER_SIZE"
     --output="$OUT/${DEVICE}-${SYSTEM_NAME}-${ANDROID_TAG}-${DATE_TAG}-super.img"
   )
+  # VAB 设备需要槽位后缀：每个分区同时定义 _a 和 _b
   for p in "${PARTITIONS[@]}"; do
-    LPM_ARGS+=(--partition="$p:readonly:0:main")
-    LPM_ARGS+=(--image="$p=coloros/$p.img")
+    LPM_ARGS+=(--partition="${p}_a:readonly:0:main")
+    LPM_ARGS+=(--image="${p}_a=coloros/$p.img")
+    LPM_ARGS+=(--partition="${p}_b:readonly:0:main")
+    LPM_ARGS+=(--image="${p}_b=coloros/$p.img")
   done
   lpmake "${LPM_ARGS[@]}"
   echo ">>> super.img: $OUT/${DEVICE}-${SYSTEM_NAME}-${ANDROID_TAG}-${DATE_TAG}-super.img"
 }
 
-pack_partitions
-
-# 重命名 system.img
-if [ -f "coloros/system.img" ]; then
-  IMG_NAME="${DEVICE}-${SYSTEM_NAME}-${ANDROID_TAG}-${DATE_TAG}-system.img"
-  cp "coloros/system.img" "$OUT/$IMG_NAME"
-  echo ">>> 系统镜像: $OUT/$IMG_NAME"
+write_flash_script() {
+  cat > "$OUT/flash-fastbootd.sh" << 'EOFF'
+#!/bin/bash
+# ColorOS port — fastbootd 逐分区刷入（VAB 设备）
+# 用法: 手机进 bootloader 后 ./flash-fastbootd.sh
+set -e
+fastboot reboot fastboot
+sleep 15
+for p in system system_ext vendor product odm my_product my_stock my_heytap \
+         my_carrier my_bigball my_region my_manifest my_engineering \
+         system_dlkm vendor_dlkm; do
+  [ -f "$p.img" ] || continue
+  # sparse 头部 total_blocks(offset16,u32)*4096 = raw 分区大小
+  size=$(python3 -c "import struct,sys;f=open('$p.img','rb');f.seek(16);print(struct.unpack('<I',f.read(4))[0]*4096)")
+  echo ">>> $p (size=$size)"
+  fastboot delete-logical-partition "${p}_a" 2>/dev/null || true
+  fastboot delete-logical-partition "${p}_b" 2>/dev/null || true
+  fastboot create-logical-partition "${p}_a" "$size" 2>/dev/null || true
+  fastboot create-logical-partition "${p}_b" "$size" 2>/dev/null || true
+  fastboot flash "${p}_a" "$p.img"
+  fastboot flash "${p}_b" "$p.img"
+done
+if [ -f "vbmeta-*.img" ] || ls vbmeta-*.img > /dev/null 2>&1; then
+  fastboot flash vbmeta vbmeta-*.img --disable-verity --disable-verification
 fi
+echo ">>> 完成。执行 fastboot reboot"
+EOFF
+  chmod +x "$OUT/flash-fastbootd.sh"
+}
+
+pack_partitions
+write_flash_script
+
+# 输出稀疏镜像（raw 太大，无法传 Release；fastbootd 直接吃 sparse）
+for img in coloros/*.img; do
+  name=$(basename "$img" .img)
+  img2simg "$img" "$OUT/$name.img" 2>/dev/null || cp "$img" "$OUT/$name.img"
+done
 
 case "$PACK_MODE" in
-  zip)   build_zip ;;
+  zip)   echo "!!! zip(卡刷) 模式对本目标不适用，改用 super/fastbootd 路径" ; build_super ;;
   super) build_super ;;
-  both)  build_zip; build_super ;;
+  both)  build_super ;;
 esac
+
+# 打包完成，释放 raw 镜像空间（输出为 sparse）
+rm -f coloros/*.img coloros/*.raw 2>/dev/null || true
+echo ">>> 磁盘占用:"
+df -h / | tail -1
+
+echo ">>> 输出目录:"
+ls -lh "$OUT/"
